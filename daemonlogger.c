@@ -111,6 +111,57 @@
 #include <sys/param.h>
 #include <sys/mount.h>
 
+/* Define SIZE_MAX if not available */
+#ifndef SIZE_MAX
+#define SIZE_MAX ((size_t)-1)
+#endif
+
+/* Define UID_MAX if not available */
+#ifndef UID_MAX
+#define UID_MAX 60000
+#endif
+
+/* Define GID_MAX if not available */
+#ifndef GID_MAX
+#define GID_MAX 60000
+#endif
+
+/* Compile-time security checks */
+#ifndef _FORTIFY_SOURCE
+#warning "Building without _FORTIFY_SOURCE - consider enabling with -D_FORTIFY_SOURCE=2"
+#endif
+
+#ifndef __SSP_STRONG__
+#ifndef __SSP__
+#warning "Building without stack protection - consider enabling with -fstack-protector-strong"
+#endif
+#endif
+
+#ifndef __PIE__
+#warning "Building without PIE - consider enabling with -fPIE and -pie"
+#endif
+
+/* Security feature detection */
+#ifdef __has_feature
+# if __has_feature(address_sanitizer)
+#  define DAEMONLOGGER_HAS_ASAN 1
+# endif
+# if __has_feature(undefined_behavior_sanitizer)
+#  define DAEMONLOGGER_HAS_UBSAN 1
+# endif
+#endif
+
+/* Runtime security checks */
+static void check_security_features(void) {
+    /* This function will be called at startup to verify security features */
+#ifdef DAEMONLOGGER_HAS_ASAN
+    msg("Built with AddressSanitizer");
+#endif
+#ifdef DAEMONLOGGER_HAS_UBSAN
+    msg("Built with UndefinedBehaviorSanitizer");
+#endif
+}
+
 #ifdef LINUX
 #include <sys/statvfs.h>
 #include <sys/vfs.h>
@@ -132,6 +183,16 @@
 
 #define PRUNE_OLDEST_ABSOLUTE   0
 #define PRUNE_OLDEST_IN_RUN     1
+
+/* Maximum safe path length */
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* Signal flags - must be volatile sig_atomic_t for signal safety */
+static volatile sig_atomic_t shutdown_requested = 0;
+static volatile sig_atomic_t restart_requested = 0;
+static volatile sig_atomic_t dump_stats_requested = 0;
 
 /* Fix for broken linux <sys/queue.h> */
 #ifndef HAVE_TAILQFOREACH
@@ -207,9 +268,6 @@ typedef struct _rt_config
     int filecount;
     int showver;
     int datalink;
-    int shutdown_requested;
-    int restart_requested;
-    int dump_stats_requested;
     int ringbuffer;
     int use_syslog;
     int readback_mode;
@@ -254,6 +312,12 @@ rt_config_t rt_config;
 
 static char *pidfile = "daemonlogger.pid";
 static char *pidpath = "/var/run";
+
+/* Secure helper functions */
+static int is_safe_filename(const char *filename);
+static char *safe_strdup(const char *src);
+static int safe_path_join(char *dest, size_t dest_size, const char *dir, const char *file);
+static int validate_path_components(const char *path);
 
 static void (*packet_handler)(char *user, 
                               struct pcap_pkthdr *pkthdr, 
@@ -314,26 +378,151 @@ static void msg(const char *format, ...)
     va_end(ap);
 }
 
+/* Secure helper function implementations */
+static int is_safe_filename(const char *filename)
+{
+    if (filename == NULL || strlen(filename) == 0) {
+        return 0;
+    }
+    
+    /* Check for path traversal sequences */
+    if (strstr(filename, "..") != NULL) {
+        return 0;
+    }
+    
+    /* Check for absolute paths */
+    if (filename[0] == '/') {
+        return 0;
+    }
+    
+    /* Check for null bytes */
+    if (strlen(filename) != strcspn(filename, "\0")) {
+        return 0;
+    }
+    
+    /* Check for other dangerous characters */
+    if (strcspn(filename, "\r\n") != strlen(filename)) {
+        return 0;
+    }
+    
+    return 1;
+}
+
+static char *safe_strdup(const char *src)
+{
+    char *result;
+    
+    if (src == NULL) {
+        return NULL;
+    }
+    
+    /* Limit string length to prevent memory exhaustion */
+    if (strlen(src) > PATH_MAX) {
+        return NULL;
+    }
+    
+    result = strdup(src);
+    if (result == NULL) {
+        fatal("Memory allocation failed in safe_strdup");
+    }
+    
+    return result;
+}
+
+static int safe_path_join(char *dest, size_t dest_size, const char *dir, const char *file)
+{
+    int ret;
+    
+    if (dest == NULL || dir == NULL || file == NULL || dest_size == 0) {
+        return -1;
+    }
+    
+    /* Validate filename is safe */
+    if (!is_safe_filename(file)) {
+        return -1;
+    }
+    
+    /* Safely join paths */
+    ret = snprintf(dest, dest_size, "%s/%s", dir, file);
+    
+    /* Check for truncation */
+    if (ret >= (int)dest_size || ret < 0) {
+        return -1;
+    }
+    
+    return 0;
+}
+
+static int validate_path_components(const char *path)
+{
+    char *path_copy, *token, *saveptr;
+    int result = 1;
+    
+    if (path == NULL) {
+        return 0;
+    }
+    
+    path_copy = safe_strdup(path);
+    if (path_copy == NULL) {
+        return 0;
+    }
+    
+    /* Check each path component */
+    token = strtok_r(path_copy, "/", &saveptr);
+    while (token != NULL) {
+        if (strcmp(token, "..") == 0 || strcmp(token, ".") == 0) {
+            result = 0;
+            break;
+        }
+        token = strtok_r(NULL, "/", &saveptr);
+    }
+    
+    free(path_copy);
+    return result;
+}
+
 static int is_valid_path(char *path)
 {
     struct stat st;
+    int fd;
 
     if(path == NULL)
         return 0;
+    
+    /* Validate path components for security */
+    if (!validate_path_components(path)) {
+        return 0;
+    }
         
-    if(stat(path, &st) != 0)
+    /* Use lstat to avoid following symlinks */
+    if(lstat(path, &st) != 0)
         return 0;
 
-    if(!S_ISDIR(st.st_mode) || access(path, W_OK) == -1)
+    /* Ensure it's a directory and not a symlink */
+    if(!S_ISDIR(st.st_mode))
     {
         return 0;
     }
+    
+    /* Use file descriptor-based access check to avoid TOCTOU */
+    fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        return 0;
+    }
+    
+    /* Check write access using the file descriptor */
+    if (faccessat(fd, ".", W_OK, 0) == -1) {
+        close(fd);
+        return 0;
+    }
+    
+    close(fd);
     return 1;
 }
 
 static int create_pid_file(char *path, char *filename)
 {
-    char filepath[STDBUF];
+    char filepath[PATH_MAX];
     char *fp = NULL;
     char *fn = NULL;
     char pid_buffer[12];
@@ -341,7 +530,7 @@ static int create_pid_file(char *path, char *filename)
     int rval;
     int fd;
 
-    memset(filepath, 0, STDBUF);
+    memset(filepath, 0, PATH_MAX);
     
     if(!filename)
         fn = pidfile;
@@ -353,16 +542,28 @@ static int create_pid_file(char *path, char *filename)
     else
         fp = path;
     
-    if(is_valid_path(fp))
-        snprintf(filepath, STDBUF-1, "%s/%s", fp, fn);
-    else
+    /* Validate filename is safe */
+    if (!is_safe_filename(fn)) {
+        fatal("PID filename \"%s\" contains unsafe characters!", fn);
+    }
+    
+    if(is_valid_path(fp)) {
+        if (safe_path_join(filepath, PATH_MAX, fp, fn) != 0) {
+            fatal("Failed to construct safe PID file path!");
+        }
+    } else {
         fatal("PID path \"%s\" isn't a writeable directory!", fp);
+    }
     
-    rt_config.true_pid_name = strdup(filename);
+    rt_config.true_pid_name = safe_strdup(filepath);
     
-    if((fd = open(filepath, O_CREAT | O_WRONLY,
-                    S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)) == -1)
+    /* Use O_EXCL to prevent overwriting existing files */
+    if((fd = open(filepath, O_CREAT | O_WRONLY | O_EXCL,
+                    S_IRUSR | S_IWUSR)) == -1)
     {
+        if (errno == EEXIST) {
+            fatal("PID file \"%s\" already exists!", filepath);
+        }
         return ERROR;
     }
 
@@ -427,27 +628,41 @@ int daemonize()
 char *get_filename()
 {
     time_t currtime;
+    char safe_filename[PATH_MAX];
+    int ret;
 
     memset(rt_config.logdir, 0, STDBUF);
     currtime = time(NULL);
+    
+    /* Validate logfilename is safe */
+    if (!is_safe_filename(rt_config.logfilename)) {
+        fatal("Log filename \"%s\" contains unsafe characters!", rt_config.logfilename);
+        return NULL;
+    }
+    
+    /* Create timestamped filename */
+    ret = snprintf(safe_filename, PATH_MAX, "%s.%lu.pcap",
+                   rt_config.logfilename, (long unsigned int) currtime);
+    
+    if (ret >= PATH_MAX || ret < 0) {
+        fatal("Log filename too long!");
+        return NULL;
+    }
+    
     if(rt_config.logpath != NULL)
     {
-        if(snprintf(rt_config.logdir, 
-                    STDBUF, 
-                    "%s/%s.%lu.pcap", 
-                    rt_config.logpath, 
-                    rt_config.logfilename, 
-                    (long unsigned int) currtime) < 0)
-            return NULL;        
+        if (safe_path_join(rt_config.logdir, STDBUF, rt_config.logpath, safe_filename) != 0) {
+            fatal("Failed to construct safe log file path!");
+            return NULL;
+        }
     }
     else
     {
-        if(snprintf(rt_config.logdir, 
-                    STDBUF, 
-                    "%s.%lu.pcap",
-                    rt_config.logfilename,
-                    (long unsigned int) currtime) < 0)
-            return NULL;        
+        ret = snprintf(rt_config.logdir, STDBUF, "%s", safe_filename);
+        if (ret >= STDBUF || ret < 0) {
+            fatal("Log filename too long for buffer!");
+            return NULL;
+        }
     }
 
     return rt_config.logdir;
@@ -470,7 +685,30 @@ static void dl_dump_stats()
     msg("%u packets dropped by interface", stats.ps_ifdrop);
 }
 
+/* Async-signal-safe shutdown function */
 static void dl_shutdown(int signal)
+{
+    /* Only set the flag in signal handler - do cleanup in main loop */
+    shutdown_requested = 1;
+}
+
+static void dump_stats(int signal)
+{
+    dump_stats_requested = 1;
+}
+
+static void quitter(int signal)
+{
+    shutdown_requested = 1;
+}
+
+static void restarter(int signal)
+{
+    restart_requested = 1;
+}
+
+/* Non-signal-safe cleanup function to be called from main loop */
+static void perform_shutdown(void)
 {
     msg("Quitting!");
     if(rt_config.retrans_interface != NULL) 
@@ -498,17 +736,6 @@ static void dl_shutdown(int signal)
     exit(0);
 }
 
-static void dump_stats(int signal)
-{
-    rt_config.dump_stats_requested = 1;
-}
-
-static void quitter(int signal)
-{
-    rt_config.shutdown_requested = 1;
-    alarm(1);
-}
-
 static int prune_oldest_file_this_run()
 {
     struct stat sb;
@@ -518,9 +745,10 @@ static int prune_oldest_file_this_run()
     {
         if(fe->filename != NULL)
         {
-            if(stat(fe->filename, &sb) != 0)
+            /* Use lstat to avoid following symlinks */
+            if(lstat(fe->filename, &sb) != 0)
             {
-                msg("[ERR] stat failed for \"%s\": %s\n", fe->filename, 
+                msg("[ERR] lstat failed for \"%s\": %s", fe->filename, 
                     strerror(errno));
                 TAILQ_REMOVE(&file_list, fe, next);
                 free(fe->filename);
@@ -528,15 +756,26 @@ static int prune_oldest_file_this_run()
             }
             else
             {
-                if((sb.st_mode & S_IFMT) == S_IFREG)
+                /* Only process regular files, not symlinks */
+                if(S_ISREG(sb.st_mode))
                 {
                     msg("[!] Ringbuffer: deleting %s", fe->filename);
-                    unlink(fe->filename);
+                    if (unlink(fe->filename) != 0) {
+                        msg("Failed to delete file \"%s\": %s", fe->filename, strerror(errno));
+                    }
                     TAILQ_REMOVE(&file_list, fe, next);
                     free(fe->filename);
                     free(fe);
                     break;
-                }                        
+                }
+                else
+                {
+                    /* Skip non-regular files */
+                    msg("[WARN] Skipping non-regular file \"%s\"", fe->filename);
+                    TAILQ_REMOVE(&file_list, fe, next);
+                    free(fe->filename);
+                    free(fe);
+                }
             }
         }
         else
@@ -556,29 +795,51 @@ static int prune_oldest_file_in_dir()
     struct stat sb;
     time_t oldtime = 0;
     char *oldname = NULL;
-    char fpath[STDBUF+1];
+    char fpath[PATH_MAX];
+    const char *search_dir;
+    int result = 0;
     
-    memset(fpath, 0, STDBUF+1);
-    if(rt_config.logpath != NULL)
-    {
-        dirp = opendir(rt_config.logpath);        
+    memset(fpath, 0, PATH_MAX);
+    search_dir = rt_config.logpath ? rt_config.logpath : ".";
+    
+    /* Validate the search directory */
+    if (!is_valid_path((char*)search_dir)) {
+        msg("prune_oldest_file_in_dir: invalid directory path");
+        return 0;
     }
-    else
-        dirp = opendir(".");
     
+    dirp = opendir(search_dir);
     if(dirp == NULL)
     {
-        msg("opendir failed\n");
+        msg("opendir failed for \"%s\": %s", search_dir, strerror(errno));
         return 0;
     }
     
     while((dp = readdir(dirp)) != NULL)
     {
-        snprintf(fpath, STDBUF, "%s/%s", rt_config.logpath?rt_config.logpath:".", dp->d_name);
-        if(stat(fpath, &sb) != 0)
-            msg("stat failed for \"%s\": %s\n", fpath, strerror(errno));
+        /* Skip . and .. entries */
+        if (strcmp(dp->d_name, ".") == 0 || strcmp(dp->d_name, "..") == 0) {
+            continue;
+        }
+        
+        /* Validate filename is safe */
+        if (!is_safe_filename(dp->d_name)) {
+            continue;
+        }
+        
+        if (safe_path_join(fpath, PATH_MAX, search_dir, dp->d_name) != 0) {
+            msg("Failed to construct path for \"%s\"", dp->d_name);
+            continue;
+        }
+        
+        /* Use lstat to avoid following symlinks */
+        if(lstat(fpath, &sb) != 0) {
+            msg("lstat failed for \"%s\": %s", fpath, strerror(errno));
+            continue;
+        }
 
-        if((sb.st_mode & S_IFMT) == S_IFREG)
+        /* Only process regular files, not symlinks or other types */
+        if(S_ISREG(sb.st_mode))
         {
             if(strstr(dp->d_name, rt_config.logfilename))
             {
@@ -589,21 +850,26 @@ static int prune_oldest_file_in_dir()
                     {
                         free(oldname);
                     }
-                    oldname = strdup(fpath);
+                    oldname = safe_strdup(fpath);
                 }                                            
             }
         }
     }
 
     closedir(dirp);
-    msg("[!] Ringbuffer: deleting %s", oldname);
-    if(*oldname != 0)
+    
+    if(oldname != NULL && strlen(oldname) > 0)
     {
-        unlink(oldname);
-        return 1;
+        msg("[!] Ringbuffer: deleting %s", oldname);
+        if (unlink(oldname) == 0) {
+            result = 1;
+        } else {
+            msg("Failed to delete file \"%s\": %s", oldname, strerror(errno));
+        }
+        free(oldname);
     }
     
-    return 0;
+    return result;
 }
 
 static int open_log_file()
@@ -676,8 +942,11 @@ static int open_log_file()
     {
         if(rt_config.ringbuffer == 1)
         {
-            fe = calloc(sizeof(struct file_entry), sizeof(char));
-            if((fe->filename = strdup(filepath)) != NULL)
+            fe = calloc(1, sizeof(struct file_entry));
+            if (fe == NULL) {
+                fatal("Memory allocation failed for file entry");
+            }
+            if((fe->filename = safe_strdup(filepath)) != NULL)
             {
                 if(rt_config.prune_flag == PRUNE_OLDEST_IN_RUN)
                     TAILQ_INSERT_TAIL(&file_list, fe, next);
@@ -709,14 +978,15 @@ static int open_log_file()
 
 static int drop_privs(void)
 {
-    struct group *gr;
-    struct passwd *pw;
+    struct group *gr = NULL;
+    struct passwd *pw = NULL;
     char *endptr;
     int i;
     int do_setuid = 0;
     int do_setgid = 0;
     unsigned long groupid = 0;
     unsigned long userid = 0;
+    uid_t original_uid = getuid();
 
     if(rt_config.group_name != NULL)
     {
@@ -724,11 +994,20 @@ static int drop_privs(void)
         if(isdigit(rt_config.group_name[0]) == 0)
         {
             gr = getgrnam(rt_config.group_name);
+            if (gr == NULL) {
+                fatal("Group '%s' not found", rt_config.group_name);
+            }
             groupid = gr->gr_gid;
         }
         else
         {
             groupid = strtoul(rt_config.group_name, &endptr, 10);
+            if (endptr == rt_config.group_name || *endptr != '\0') {
+                fatal("Invalid group ID: %s", rt_config.group_name);
+            }
+            if (groupid > GID_MAX) {
+                fatal("Group ID too large: %lu", groupid);
+            }
         }        
     }
     
@@ -739,22 +1018,42 @@ static int drop_privs(void)
         if(isdigit(rt_config.user_name[0]) == 0)
         {
             pw = getpwnam(rt_config.user_name);
+            if (pw == NULL) {
+                fatal("User '%s' not found", rt_config.user_name);
+            }
             userid = pw->pw_uid;
         }
         else
         {
             userid = strtoul(rt_config.user_name, &endptr, 10);
+            if (endptr == rt_config.user_name || *endptr != '\0') {
+                fatal("Invalid user ID: %s", rt_config.user_name);
+            }
+            if (userid > UID_MAX) {
+                fatal("User ID too large: %lu", userid);
+            }
             pw = getpwuid(userid);
+            if (pw == NULL) {
+                fatal("User ID %lu not found", userid);
+            }
         }
         
         if(rt_config.group_name == NULL)
             groupid = pw->pw_gid;
     }
 
+    /* Drop privileges in the correct order */
+    if(do_setuid)
+    {
+        /* Initialize supplementary groups first (must be done as root) */
+        if(original_uid == 0 && initgroups(rt_config.user_name, groupid) < 0)
+            fatal("Unable to init group names (%s/%lu): %s", rt_config.user_name, groupid, strerror(errno));
+    }
+    
     if(do_setgid)
     {
         if((i = setgid(groupid)) < 0)
-            fatal("Unable to set group ID: %s", strerror(i));
+            fatal("Unable to set group ID to %lu: %s", groupid, strerror(errno));
     }
     
     endgrent();
@@ -762,12 +1061,29 @@ static int drop_privs(void)
     
     if(do_setuid)
     {
-        if(getuid() == 0 && initgroups(rt_config.user_name, groupid) < 0)
-            fatal("Unable to init group names (%s/%lu)", rt_config.user_name, groupid);
         if((i = setuid(userid)) < 0)
-            fatal("Unable to set user ID: %s\n", strerror(i));
+            fatal("Unable to set user ID to %lu: %s", userid, strerror(errno));
     }
     
+    /* Verify privilege drop was successful */
+    if (do_setuid && original_uid == 0) {
+        /* Try to regain root - this should fail */
+        if (setuid(0) == 0) {
+            fatal("SECURITY ERROR: Failed to drop root privileges permanently!");
+        }
+        if (seteuid(0) == 0) {
+            fatal("SECURITY ERROR: Failed to drop effective root privileges!");
+        }
+    }
+    
+    if (do_setgid && original_uid == 0) {
+        /* Try to regain root group - this should fail */
+        if (setgid(0) == 0) {
+            fatal("SECURITY ERROR: Failed to drop root group privileges!");
+        }
+    }
+    
+    msg("Successfully dropped privileges to UID:%lu GID:%lu", userid, groupid);
     return 0;
 }
 
@@ -971,7 +1287,7 @@ static int log_rollover()
 
 static void dl_restart()
 {
-    rt_config.restart_requested = 0;
+    restart_requested = 0;
 
     if(rt_config.retrans_interface == NULL)
     {
@@ -988,38 +1304,57 @@ static void dl_restart()
     sniff_loop();   
 }
 
-static void restarter(int signal)
-{
-    msg("Caught SIGHUP, restarting...");
-    rt_config.restart_requested = 1;
-}
 
 static char *load_bpf_file(char *filename)
 {
     int fd;
-    int readbytes;
+    ssize_t readbytes;
     char *filebuf;
     char *comment;
     struct stat buf;
+    const size_t MAX_BPF_FILE_SIZE = 1024 * 1024; /* 1MB limit */
     
     if((fd = open(filename, O_RDONLY)) < 0)
-        fatal("Unable to open BPF filter file %s: %s\n", 
-              filename, 
-              pcap_strerror(errno));
+        fatal("Unable to open BPF filter file %s: %s", 
+              filename, strerror(errno));
               
-    if(fstat(fd, &buf) < 0)
-        fatal("Stat failed on %s: %s\n", filename, pcap_strerror(errno));
-        
-    filebuf = calloc((unsigned int)buf.st_size + 1, sizeof(unsigned char));
-
-    if((readbytes = read(fd, filebuf, (int) buf.st_size)) < 0)
-        fatal("Read failed on %s: %s\n", filename, pcap_strerror(errno));
+    if(fstat(fd, &buf) < 0) {
+        close(fd);
+        fatal("Stat failed on %s: %s", filename, strerror(errno));
+    }
     
-    if(readbytes != buf.st_size)
-        fatal("Read bytes != file bytes on %s (%d != %d)\n",
-              filename, readbytes, (int) buf.st_size);
+    /* Check file size limits */
+    if (buf.st_size < 0 || (size_t)buf.st_size > MAX_BPF_FILE_SIZE) {
+        close(fd);
+        fatal("BPF filter file %s too large (max %zu bytes)", 
+              filename, MAX_BPF_FILE_SIZE);
+    }
+    
+    if (buf.st_size == 0) {
+        close(fd);
+        fatal("BPF filter file %s is empty", filename);
+    }
+        
+    filebuf = calloc((size_t)buf.st_size + 1, sizeof(unsigned char));
+    if (filebuf == NULL) {
+        close(fd);
+        fatal("Memory allocation failed for BPF filter file");
+    }
+
+    if((readbytes = read(fd, filebuf, (size_t) buf.st_size)) < 0) {
+        close(fd);
+        free(filebuf);
+        fatal("Read failed on %s: %s", filename, strerror(errno));
+    }
+    
+    if(readbytes != buf.st_size) {
+        close(fd);
+        free(filebuf);
+        fatal("Read bytes != file bytes on %s (%zd != %lld)",
+              filename, readbytes, (long long) buf.st_size);
+    }
               
-    filebuf[(int)buf.st_size] = '\0';
+    filebuf[(size_t)buf.st_size] = '\0';
     close(fd);
     
     /* strip comments and <CR>'s */
@@ -1037,6 +1372,25 @@ static char *load_bpf_file(char *filename)
 void packet_dump(char *user, struct pcap_pkthdr *pkthdr, u_char *pkt)
 {
     time_t now;
+    
+    /* Validate packet parameters */
+    if (pkthdr == NULL || pkt == NULL) {
+        msg("packet_dump: Invalid packet parameters");
+        return;
+    }
+    
+    /* Validate packet length */
+    if (pkthdr->caplen > 65535 || pkthdr->len > 65535) {
+        msg("packet_dump: Invalid packet length (caplen=%u, len=%u)", 
+            pkthdr->caplen, pkthdr->len);
+        return;
+    }
+    
+    if (pkthdr->caplen > pkthdr->len) {
+        msg("packet_dump: caplen > len (caplen=%u, len=%u)", 
+            pkthdr->caplen, pkthdr->len);
+        return;
+    }
     
     if(rt_config.rollover)
     {
@@ -1061,15 +1415,15 @@ void packet_dump(char *user, struct pcap_pkthdr *pkthdr, u_char *pkt)
         }
     }
     
-    if(rt_config.shutdown_requested == 1)
-        dl_shutdown(0);
+    if(shutdown_requested == 1)
+        perform_shutdown();
     
-    if(rt_config.restart_requested == 1)
+    if(restart_requested == 1)
         dl_restart();
     
-    if(rt_config.dump_stats_requested == 1)
+    if(dump_stats_requested == 1)
     {
-        rt_config.dump_stats_requested = 0;
+        dump_stats_requested = 0;
         dl_dump_stats();
     }
 
@@ -1077,12 +1431,14 @@ void packet_dump(char *user, struct pcap_pkthdr *pkthdr, u_char *pkt)
     if(rt_config.flush_flag)
         pcap_dump_flush(rt_config.pdp);
         
-    if(((size_t)ftello((FILE *) rt_config.pdp)) > rt_config.rollsize)
     {
-        msg("Size limit reached (%zd - %zd = %zd), rolling over!", 
-            (size_t)ftell((FILE *) rt_config.pdp), rt_config.rollsize,
-            (size_t) ftell((FILE *) rt_config.pdp) - rt_config.rollsize);
-        log_rollover();
+        off_t current_size = ftello((FILE *) rt_config.pdp);
+        if (current_size > 0 && (u_int64_t)current_size > rt_config.rollsize)
+        {
+            msg("Size limit reached (%lld bytes > %llu bytes), rolling over!", 
+                (long long)current_size, (unsigned long long)rt_config.rollsize);
+            log_rollover();
+        }
     }
     
     return;
@@ -1090,11 +1446,37 @@ void packet_dump(char *user, struct pcap_pkthdr *pkthdr, u_char *pkt)
 
 void packet_retrans(char *user, struct pcap_pkthdr *pkthdr, u_char *pkt)
 {
+    /* Validate packet parameters */
+    if (pkthdr == NULL || pkt == NULL) {
+        msg("packet_retrans: Invalid packet parameters");
+        return;
+    }
+    
+    /* Validate packet length */
+    if (pkthdr->caplen > 65535 || pkthdr->len > 65535) {
+        msg("packet_retrans: Invalid packet length (caplen=%u, len=%u)", 
+            pkthdr->caplen, pkthdr->len);
+        return;
+    }
+    
+    if (pkthdr->caplen > pkthdr->len) {
+        msg("packet_retrans: caplen > len (caplen=%u, len=%u)", 
+            pkthdr->caplen, pkthdr->len);
+        return;
+    }
+    
+    /* Validate minimum Ethernet frame size */
+    if (pkthdr->caplen < 14) {
+        msg("packet_retrans: Packet too small for Ethernet (caplen=%u)", 
+            pkthdr->caplen);
+        return;
+    }
+    
     eth_send(rt_config.eth_retrans, pkt, pkthdr->caplen);
     
-    if(rt_config.shutdown_requested)
-        dl_shutdown(0);
-    if(rt_config.restart_requested)
+    if(shutdown_requested)
+        perform_shutdown();
+    if(restart_requested)
         dl_restart();
         
     return;
@@ -1135,7 +1517,8 @@ static int sniff_loop()
 char *copy_argv(char **argv)
 {
     char **p;
-    u_int len = 0;
+    size_t len = 0;
+    size_t arg_len = 0;
     char *buf;
     char *src, *dst;
     void ftlerr(char *,...);
@@ -1144,15 +1527,33 @@ char *copy_argv(char **argv)
     if(*p == 0)
         return NULL;
 
-    while(*p)
-        len += strlen(*p++) + 1;
+    /* Calculate total length with overflow protection */
+    while(*p) {
+        arg_len = strlen(*p);
+        
+        /* Check for potential overflow */
+        if (arg_len > PATH_MAX) {
+            fatal("Argument too long (>%d chars): %.100s...", PATH_MAX, *p);
+        }
+        
+        if (len > SIZE_MAX - arg_len - 1) {
+            fatal("Arguments too long - would cause integer overflow");
+        }
+        
+        len += arg_len + 1;
+        p++;
+    }
+
+    if (len == 0) {
+        return NULL;
+    }
 
     buf = (char *) malloc(len);
-
     if(buf == NULL)
     {
-        fatal("malloc() failed: %s\n", strerror(errno));
+        fatal("malloc() failed: %s", strerror(errno));
     }
+    
     p = argv;
     dst = buf;
 
@@ -1175,14 +1576,33 @@ static int set_rollover_time()
     now = time(NULL);
     curtime = localtime(&now);
     
+    if (curtime == NULL) {
+        fatal("localtime() failed");
+    }
+    
+    /* Validate rollover value to prevent integer overflow */
+    if (rt_config.rollover < 0 || rt_config.rollover > 10000) {
+        fatal("Invalid rollover value: %d", rt_config.rollover);
+    }
+    
     switch(rt_config.rollover_interval)
     {
         case MINUTES:
-            curtime->tm_min += rt_config.rollover;
+            if (curtime->tm_min > 60 - rt_config.rollover) {
+                curtime->tm_hour++;
+                curtime->tm_min = rt_config.rollover - (60 - curtime->tm_min);
+            } else {
+                curtime->tm_min += rt_config.rollover;
+            }
             curtime->tm_sec = 0;
             break;
         case HOURS:
-            curtime->tm_hour += rt_config.rollover;
+            if (curtime->tm_hour > 24 - rt_config.rollover) {
+                curtime->tm_mday++;
+                curtime->tm_hour = rt_config.rollover - (24 - curtime->tm_hour);
+            } else {
+                curtime->tm_hour += rt_config.rollover;
+            }
             curtime->tm_min = 0;
             curtime->tm_sec = 0;
             break;
@@ -1191,9 +1611,16 @@ static int set_rollover_time()
             curtime->tm_hour = 0;
             curtime->tm_min = 0;
             curtime->tm_sec = 0;
-            break;  
+            break;
+        default:
+            fatal("Invalid rollover interval: %d", rt_config.rollover_interval);
     }
+    
     rt_config.nextroll = mktime(curtime);
+    if (rt_config.nextroll == (time_t)-1) {
+        fatal("mktime() failed for rollover calculation");
+    }
+    
     return 0;
 }
 
@@ -1249,7 +1676,7 @@ int parse_cmd_line(int argc, char *argv[])
         switch(ch)
         {
             case 'a':
-                rt_config.archivepath = strdup(optarg);
+                rt_config.archivepath = safe_strdup(optarg);
                 break;
             case 'B':
                 rt_config.buffer_size = atoi(optarg);
@@ -1261,14 +1688,14 @@ int parse_cmd_line(int argc, char *argv[])
                 rt_config.daemon_mode = 1;
                 break;
             case 'f':
-                bpf_filename = strdup(optarg);
+                bpf_filename = safe_strdup(optarg);
                 bpf_file = 1;
                 break;
             case 'F':
                 rt_config.flush_flag = 1;
                 break;
             case 'g':
-                rt_config.group_name = strdup(optarg);
+                rt_config.group_name = safe_strdup(optarg);
                 rt_config.drop_privs_flag = 1;
                 break;
             case 'h':
@@ -1276,10 +1703,10 @@ int parse_cmd_line(int argc, char *argv[])
                 exit(0);
                 break;
             case 'i':
-                rt_config.interface = strdup(optarg);
+                rt_config.interface = safe_strdup(optarg);
                 break;
             case 'l':
-                rt_config.logpath = strdup(optarg);
+                rt_config.logpath = safe_strdup(optarg);
                 break;
             case 'm':
                 rt_config.maxfiles = atoi(optarg);
@@ -1292,25 +1719,25 @@ int parse_cmd_line(int argc, char *argv[])
                 break;
             case 'n':
                 free(rt_config.logfilename);
-                rt_config.logfilename = strdup(optarg);
+                rt_config.logfilename = safe_strdup(optarg);
                 break;
             case 'o':
-                rt_config.retrans_interface = strdup(optarg);
+                rt_config.retrans_interface = safe_strdup(optarg);
                 packet_handler = packet_retrans;
 
                 break;
             case 'p':
-                pidfile = strdup(optarg);
+                pidfile = safe_strdup(optarg);
                 break;
             case 'P':
-                pidpath = strdup(optarg);
+                pidpath = safe_strdup(optarg);
                 break;
             case 'r':
                 rt_config.ringbuffer = 1;
                 break;
             case 'R':
                 rt_config.readback_mode = 1;
-                rt_config.readfile = strdup(optarg);
+                rt_config.readfile = safe_strdup(optarg);
                 break;
             case 's':
                 if(isdigit((int)optarg[strlen(optarg)-1]))
@@ -1387,11 +1814,11 @@ int parse_cmd_line(int argc, char *argv[])
                 }
                 break;
             case 'T':
-                rt_config.chroot_dir = strdup(optarg);
+                rt_config.chroot_dir = safe_strdup(optarg);
                 rt_config.chroot_flag = 1;
                 break;
             case 'u':
-                rt_config.user_name = strdup(optarg);
+                rt_config.user_name = safe_strdup(optarg);
                 rt_config.drop_privs_flag = 1;
                 break;
             case 'v':
@@ -1497,9 +1924,12 @@ int main(int argc, char *argv[])
 
     rt_config.rollsize = 2 * (GIGABYTE);
 
-    rt_config.logfilename = strdup("daemonlogger");
+    rt_config.logfilename = safe_strdup("daemonlogger");
 
     parse_cmd_line(argc, argv);
+
+    /* Check security features */
+    check_security_features();
 
     printf("\n-*> DaemonLogger <*-\n"
            "Version %s\n"
